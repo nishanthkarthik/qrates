@@ -33,8 +33,9 @@ pub fn parse_schema(core_schema_path: &Path, derived_relations_path: &Path) -> a
 
 pub fn generate_definition(dest_path: &Path, schema: ast::DatabaseSchema) {
     let tokens = generator::generate_tokens(schema);
+    let tokens = prettyplease::unparse(&syn::parse_file(tokens.to_string().as_str()).unwrap());
     let mut file = File::create(dest_path).unwrap();
-    file.write_all(tokens.to_string().as_bytes()).unwrap();
+    file.write_all(tokens.as_bytes()).unwrap();
 }
 
 pub fn generate_query(schema: ast::DatabaseSchema, input: TokenStream) -> TokenStream {

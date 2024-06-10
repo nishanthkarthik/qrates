@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use log_derive::logfn_inputs;
 use rustc_hir::definitions::DefPathData;
 use rustc_hir::{def::DefKind, def_id::DefId};
 use rustc_middle::ty::{self, GenericArg, TyCtxt};
@@ -91,7 +92,7 @@ fn build_pretty_description<'t>(
                 build_pretty_description(tcx, parent_id, parent_substs, desc);
                 let component_name = crate::mirai_utils::component_name(&data);
                 desc.path.push_str("::");
-                desc.path.push_str(component_name);
+                desc.path.push_str(component_name.as_str());
             }
         }
 
@@ -99,13 +100,12 @@ fn build_pretty_description<'t>(
             let generics = tcx.generics_of(def_id);
 
             let resolved_generics = generics
-                .own_substs_no_defaults(tcx, substs)
+                .own_args_no_defaults(tcx, substs)
                 .iter()
                 .flat_map(|arg| {
-                    use ty::GenericArgKind::*;
                     let subst_ty = match arg.unpack() {
-                        Type(ty) => ty,
-                        Lifetime(_) | Const(_) => return None,
+                        ty::GenericArgKind::Type(ty) => ty,
+                        ty::GenericArgKind::Lifetime(_) | ty::GenericArgKind::Const(_) => return None,
                     };
                     let subst_desc = match subst_ty.kind() {
                         // for our evaluation, we don't care which function is passed, or even how it's referenced

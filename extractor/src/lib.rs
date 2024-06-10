@@ -30,10 +30,8 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_interface::Queries;
-use rustc_middle::ty::{
-    query::{ExternProviders, Providers},
-    TyCtxt,
-};
+use rustc_middle::ty::TyCtxt;
+use rustc_middle::util::{Providers};
 use rustc_session::Session;
 use rustc_span::def_id::LocalDefId;
 use std::collections::HashMap;
@@ -42,6 +40,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use rustc_middle::query::ExternProviders;
 
 /// The struct to share the state among queries.
 #[derive(Default)]
@@ -68,7 +67,7 @@ fn analyse_with_tcx(name: String, tcx: TyCtxt, session: &Session) {
         cargo_pkg_name,
         cargo_pkg_version,
         name,
-        hash.as_u64().into(),
+        hash.as_u128().into(),
         session.opts.edition.to_string(),
     );
 
@@ -177,7 +176,7 @@ fn analyse_with_tcx(name: String, tcx: TyCtxt, session: &Session) {
 }
 
 pub fn analyse<'tcx>(compiler: &Compiler, queries: &'tcx Queries<'tcx>) {
-    let session = compiler.session();
+    let session = &compiler.sess;
     queries.global_ctxt().unwrap().enter(|tcx| {
         let name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string();
         assert!(
@@ -200,7 +199,7 @@ pub fn override_queries(
 fn unsafety_check_result<'tcx>(
     tcx: TyCtxt<'tcx>,
     local_def_id: LocalDefId,
-) -> &'tcx rustc_middle::mir::UnsafetyCheckResult {
+) -> &'tcx rustc_middle::thir::UnsafetyCheckResult {
     let mut providers = Providers::default();
     rustc_mir_transform::provide(&mut providers);
     let original_unsafety_check_result = providers.unsafety_check_result;

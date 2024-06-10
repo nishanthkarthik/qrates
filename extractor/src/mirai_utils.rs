@@ -1,21 +1,23 @@
 // Copyright (c) Facebook, Inc. and its affiliates.
 //
-// This file is taken from
-// https://raw.githubusercontent.com/facebookexperimental/MIRAI/8f294e6919ff3e61f4866593ede58851c875b49f/checker/src/utils.rs
-//
-// This source code is licensed under the MIT license found in
-// https://github.com/facebookexperimental/MIRAI/blob/8f294e6919ff3e61f4866593ede58851c875b49f/LICENSE.
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
 
-#![allow(dead_code)]
+use std::any::Any;
+use std::io::Write;
+use std::rc::Rc;
 
 use log::debug;
 use log_derive::{logfn, logfn_inputs};
+
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
-use rustc_hir::{ItemKind, Node};
-use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
-use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
-use std::rc::Rc;
+use rustc_hir::Node;
+use rustc_middle::ty::print::{FmtPrinter, Printer};
+use rustc_middle::ty::{
+    FloatTy, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, UintTy,
+};
 
 /// Returns the location of the rust system binaries that are associated with this build of Mirai.
 /// The location is obtained by looking at the contents of the environmental variables that were
@@ -29,49 +31,65 @@ pub fn find_sysroot() -> String {
     let home = option_env!("RUSTUP_HOME");
     let toolchain = option_env!("RUSTUP_TOOLCHAIN");
     match (home, toolchain) {
-        (Some(home), Some(toolchain)) => format!("{}/toolchains/{}", home, toolchain),
-        _ => option_env!("RUST_SYSROOT")
-            .expect(
-                "Could not find sysroot. Specify the RUST_SYSROOT environment variable, \
+        (Some(home), Some(toolchain)) => format!("{home}/toolchains/{toolchain}"),
+        _ => match option_env!("RUST_SYSROOT") {
+            None => {
+                panic!(
+                    "Could not find sysroot. Specify the RUST_SYSROOT environment variable, \
                  or use rustup to set the compiler to use for Mirai",
-            )
-            .to_owned(),
+                )
+            }
+            Some(sys_root) => sys_root.to_owned(),
+        },
     }
 }
 
-/// Returns true if the function identified by def_id is a public function.
+/// Returns true if the function identified by def_id is a has a parameter that is, or contains,
+/// a function pointer or closure or generator that can be called by the function.
+/// The function body is not analyzed to determine that such parameters are actually called
+/// and the check does not traverse past references, so this check is approximate.
+/// It is intended to filter out higher order functions from the set of functions used as analysis
+/// roots, which we want to do because we can't accurately analyze a higher order function without
+/// information from its calling context.
 #[logfn(TRACE)]
-pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
-    if let Some(node) = tcx.hir().get_if_local(def_id) {
-        let visibility = tcx.visibility(def_id);
-        match node {
-            Node::Expr(rustc_hir::Expr {
-                kind: rustc_hir::ExprKind::Closure { .. },
-                ..
-            }) => {
-                let parent_def_id = tcx.parent(def_id);
-                is_public(parent_def_id, tcx)
-            }
-            Node::Item(item) => match item.kind {
-                ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..) => {
-                    visibility == ty::Visibility::Public
-                }
-                _ => {
-                    debug!("def_id is unsupported item kind {:?}", item.kind);
-                    false
-                }
-            },
-            Node::ImplItem(_) => visibility == ty::Visibility::Public,
-            Node::TraitItem(..) => true,
-            Node::AnonConst(..) => false,
-            _ => {
-                debug!("def_id is not an item {:?}", node);
-                false
+pub fn is_higher_order_function(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
+    let fn_ty = tcx.type_of(def_id).skip_binder();
+    if fn_ty.is_fn() {
+        let fn_sig = fn_ty.fn_sig(tcx).skip_binder();
+        for param_ty in fn_sig.inputs() {
+            if contains_function(*param_ty, tcx) {
+                return true;
             }
         }
-    } else {
-        false
     }
+    false
+}
+
+/// Returns true if the given type is a function, a closure, a generator, or a struct with
+/// a field that is (or contains) a function in this sense.
+/// This does not traverse references, so the answer is approximate.
+#[logfn(TRACE)]
+pub fn contains_function<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    if ty.is_fn() || ty.is_closure() || ty.is_coroutine() || ty.is_coroutine_closure() {
+        return true;
+    }
+    if let TyKind::Adt(def, args) = ty.kind() {
+        for variant in def.variants().iter() {
+            for (_, field) in variant.fields.iter().enumerate() {
+                let field_ty = field.ty(tcx, args);
+                if contains_function(field_ty, tcx) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns true if the function identified by def_id is defined as part of a trait.
+#[logfn(TRACE)]
+pub fn is_trait_method(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
+    tcx.is_trait(tcx.parent(def_id))
 }
 
 /// Returns a string that is a valid identifier, made up from the concatenation of
@@ -79,48 +97,52 @@ pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
 #[logfn(TRACE)]
 pub fn argument_types_key_str<'tcx>(
     tcx: TyCtxt<'tcx>,
-    generic_args: SubstsRef<'tcx>,
-) -> Rc<String> {
+    generic_args: Option<GenericArgsRef<'tcx>>,
+) -> Rc<str> {
     let mut result = "_".to_string();
-    for generic_ty_arg in generic_args.types() {
-        result.push('_');
-        append_mangled_type(&mut result, generic_ty_arg, tcx);
+    if let Some(generic_args) = generic_args {
+        for generic_ty_arg in generic_args.types() {
+            result.push('_');
+            append_mangled_type(&mut result, generic_ty_arg, tcx);
+        }
     }
-    Rc::new(result)
+    Rc::from(result.as_str())
 }
 
 /// Appends a string to str with the constraint that it must uniquely identify ty and also
 /// be a valid identifier (so that core library contracts can be written for type specialized
 /// generic trait methods).
-#[logfn(TRACE)]
 fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) {
+    use std::fmt::Write;
     match ty.kind() {
         TyKind::Bool => str.push_str("bool"),
         TyKind::Char => str.push_str("char"),
         TyKind::Int(int_ty) => {
             str.push_str(match int_ty {
-                ty::IntTy::Isize => "isize",
-                ty::IntTy::I8 => "i8",
-                ty::IntTy::I16 => "i16",
-                ty::IntTy::I32 => "i32",
-                ty::IntTy::I64 => "i64",
-                ty::IntTy::I128 => "i128",
+                IntTy::Isize => "isize",
+                IntTy::I8 => "i8",
+                IntTy::I16 => "i16",
+                IntTy::I32 => "i32",
+                IntTy::I64 => "i64",
+                IntTy::I128 => "i128",
             });
         }
         TyKind::Uint(uint_ty) => {
             str.push_str(match uint_ty {
-                ty::UintTy::Usize => "usize",
-                ty::UintTy::U8 => "u8",
-                ty::UintTy::U16 => "u16",
-                ty::UintTy::U32 => "u32",
-                ty::UintTy::U64 => "u64",
-                ty::UintTy::U128 => "u128",
+                UintTy::Usize => "usize",
+                UintTy::U8 => "u8",
+                UintTy::U16 => "u16",
+                UintTy::U32 => "u32",
+                UintTy::U64 => "u64",
+                UintTy::U128 => "u128",
             });
         }
         TyKind::Float(float_ty) => {
             str.push_str(match float_ty {
-                ty::FloatTy::F32 => "f32",
-                ty::FloatTy::F64 => "f64",
+                FloatTy::F16 => "f16",
+                FloatTy::F32 => "f32",
+                FloatTy::F64 => "f64",
+                FloatTy::F128 => "f128",
             });
         }
         TyKind::Adt(def, subs) => {
@@ -135,14 +157,27 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
         TyKind::Closure(def_id, subs) => {
             str.push_str("closure_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
-            for sub in subs.as_closure().substs {
+            for sub in subs.as_closure().args {
                 if let GenericArgKind::Type(ty) = sub.unpack() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
             }
         }
-        TyKind::Dynamic(..) => str.push_str(&format!("dyn_{:?}", ty)),
+        TyKind::Dynamic(trait_data, ..) => {
+            str.push_str("trait_");
+            if let Some(principal) = trait_data.principal() {
+                let principal =
+                    tcx.normalize_erasing_late_bound_regions(rustc_middle::ty::ParamEnv::reveal_all(), principal);
+                str.push_str(qualified_type_name(tcx, principal.def_id).as_str());
+                for sub in principal.args {
+                    if let GenericArgKind::Type(ty) = sub.unpack() {
+                        str.push('_');
+                        append_mangled_type(str, ty, tcx);
+                    }
+                }
+            }
+        }
         TyKind::Foreign(def_id) => {
             str.push_str("extern_type_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
@@ -157,20 +192,35 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
                 }
             }
         }
-        TyKind::Generator(def_id, subs, ..) => {
+        TyKind::Coroutine(def_id, subs, ..) => {
             str.push_str("generator_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
-            for sub in subs.as_generator().substs {
+            for sub in subs.as_coroutine().args {
                 if let GenericArgKind::Type(ty) = sub.unpack() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
             }
         }
-        TyKind::GeneratorWitness(binder) => {
-            for ty in binder.skip_binder().iter() {
-                str.push('_');
-                append_mangled_type(str, ty, tcx)
+        TyKind::CoroutineWitness(def_id, _) => {
+            let layout = tcx
+                .mir_coroutine_witnesses(def_id)
+                .clone();
+            if let Some(layout) = layout {
+                for arg in layout.field_tys.iter() {
+                    str.push('_');
+                    append_mangled_type(str, arg.ty, tcx)
+                }
+            }
+        }
+        TyKind::Alias(rustc_middle::ty::Opaque, rustc_middle::ty::AliasTy { def_id, args, .. }) => {
+            str.push_str("impl_");
+            str.push_str(qualified_type_name(tcx, *def_id).as_str());
+            for sub in *args {
+                if let GenericArgKind::Type(ty) = sub.unpack() {
+                    str.push('_');
+                    append_mangled_type(str, ty, tcx);
+                }
             }
         }
         TyKind::Str => str.push_str("str"),
@@ -182,13 +232,13 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("slice_");
             append_mangled_type(str, *ty, tcx);
         }
-        TyKind::RawPtr(ty_and_mut) => {
+        TyKind::RawPtr(ty, mutbl) => {
             str.push_str("pointer_");
-            match ty_and_mut.mutbl {
+            match mutbl {
                 rustc_hir::Mutability::Mut => str.push_str("mut_"),
                 rustc_hir::Mutability::Not => str.push_str("const_"),
             }
-            append_mangled_type(str, ty_and_mut.ty, tcx);
+            append_mangled_type(str, *ty, tcx);
         }
         TyKind::Ref(_, ty, mutability) => {
             str.push_str("ref_");
@@ -202,48 +252,35 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("fn_ptr_");
             for arg_type in fn_sig.inputs() {
                 append_mangled_type(str, *arg_type, tcx);
-                str.push_str("_");
+                str.push('_');
             }
             append_mangled_type(str, fn_sig.output(), tcx);
         }
         TyKind::Tuple(types) => {
             str.push_str("tuple_");
-            str.push_str(&format!("{}", types.len()));
+            write!(str, "{}", types.len()).expect("enough space");
             types.iter().for_each(|t| {
                 str.push('_');
                 append_mangled_type(str, t, tcx);
             });
         }
         TyKind::Param(param_ty) => {
-            let pty: Ty<'tcx> = param_ty.to_ty(tcx);
-            if ty.eq(&pty) {
-                str.push_str(&format!("{:?}", ty));
-            } else {
-                append_mangled_type(str, pty, tcx);
-            }
+            str.push_str("generic_par_");
+            str.push_str(param_ty.name.as_str());
         }
-        ty::TyKind::Alias(alias_kind, alias_type) => match alias_kind {
-            ty::AliasKind::Projection => {
-                append_mangled_type(str, alias_type.self_ty(), tcx);
-                str.push_str("_as_");
-                str.push_str(qualified_type_name(tcx, alias_type.def_id).as_str());
-            }
-            ty::AliasKind::Opaque => {
-                str.push_str("impl_");
-                str.push_str(qualified_type_name(tcx, alias_type.def_id).as_str());
-                for sub in alias_type.substs {
-                    if let GenericArgKind::Type(ty) = sub.unpack() {
-                        str.push('_');
-                        append_mangled_type(str, ty, tcx);
-                    }
-                }
-            }
-        },
+        TyKind::Alias(rustc_middle::ty::Projection, projection_ty) => {
+            append_mangled_type(str, projection_ty.self_ty(), tcx);
+            str.push_str("_as_");
+            str.push_str(qualified_type_name(tcx, projection_ty.def_id).as_str());
+        }
+        TyKind::Never => {
+            str.push('_');
+        }
         _ => {
             //todo: add cases as the need arises, meanwhile make the need obvious.
             debug!("{:?}", ty);
             debug!("{:?}", ty.kind());
-            str.push_str(&format!("default formatted {:?}", ty))
+            write!(str, "default formatted {ty:?}").expect("enough space");
         }
     }
 }
@@ -276,9 +313,8 @@ fn crate_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// long as the definition does not change its name or location, so it can be used to
 /// transfer information from one compilation to the next, making incremental analysis possible.
 #[logfn(TRACE)]
-pub fn summary_key_str(tcx: TyCtxt<'_>, def_id: DefId) -> Rc<String> {
+pub fn summary_key_str(tcx: TyCtxt<'_>, def_id: DefId) -> Rc<str> {
     let mut name = crate_name(tcx, def_id);
-    let mut type_ns: Option<String> = None;
     for component in &tcx.def_path(def_id).data {
         if name.ends_with("foreign_contracts") {
             // By stripping off this special prefix, we allow this crate (or module) to define
@@ -286,43 +322,28 @@ pub fn summary_key_str(tcx: TyCtxt<'_>, def_id: DefId) -> Rc<String> {
             // We use this to provide contracts for functions defined in crates we do not
             // wish to modify in place.
             name.clear();
-        } else {
+        } else if !name.ends_with('.') {
             name.push('.');
         }
         push_component_name(component.data, &mut name);
-        if let DefPathData::TypeNs(sym) = component.data {
-            type_ns = Some(sym.as_str().to_string());
-        }
-        if component.disambiguator != 0 {
-            name.push('_');
-
-            if component.data == DefPathData::Impl {
-                let parent_def_id = tcx.parent(def_id);
-                if let Some(type_ns) = &type_ns {
-                    let def_kind = tcx.def_kind(parent_def_id);
-                    use rustc_hir::def::DefKind::*;
-
-                    if type_ns == "num"
-                        && (def_kind == Struct || def_kind == Union || def_kind == Enum)
-                    {
-                        append_mangled_type(
-                            &mut name,
-                            tcx.type_of(parent_def_id).skip_binder(),
-                            tcx,
-                        );
-                        continue;
-                    }
-                }
-                if let Some(type_ns) = &type_ns {
-                    name.push_str(&type_ns);
-                    continue;
-                }
+        if component.data == DefPathData::Impl {
+            let parent_def_id = tcx.parent(def_id);
+            let parent_def_kind = tcx.def_kind(parent_def_id);
+            if matches!(
+                parent_def_kind,
+                DefKind::Struct
+                    | DefKind::Union
+                    | DefKind::Enum
+                    | DefKind::Variant
+                    | DefKind::TyAlias { .. }
+                    | DefKind::Impl { .. },
+            ) {
+                name.push('_');
+                append_mangled_type(&mut name, tcx.type_of(parent_def_id).skip_binder(), tcx);
             }
-            let da = component.disambiguator.to_string();
-            name.push_str(da.as_str());
         }
     }
-    Rc::new(name)
+    Rc::from(name.as_str())
 }
 
 /// Returns true if the first component is a module named "foreign_contracts".
@@ -338,23 +359,122 @@ pub fn is_foreign_contract(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     }
 }
 
-fn push_component_name(component_data: DefPathData, target: &mut String) {
-    target.push_str(component_name(&component_data));
-}
-
-pub fn component_name(component_data: &DefPathData) -> &str {
+#[logfn_inputs(TRACE)]
+pub fn push_component_name(component_data: DefPathData, target: &mut String) {
     use DefPathData::*;
     match component_data {
-        TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => name.as_str(),
-        CrateRoot => "crate_root",
-        Impl => "implement",
-        ForeignMod => "foreign",
-        Use => "use",
-        GlobalAsm => "global_asm",
-        ClosureExpr => "closure",
-        Ctor => "ctor",
-        AnonConst => "constant",
-        ImplTrait => "implement_trait",
-        ImplTraitAssocTy => "implement_trait_associated_type",
+        TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => {
+            target.push_str(name.as_str());
+        }
+        _ => target.push_str(match component_data {
+            CrateRoot => "crate_root",
+            Impl => "implement",
+            ForeignMod => "foreign",
+            Use => "use",
+            GlobalAsm => "global_asm",
+            Closure => "closure",
+            Ctor => "ctor",
+            AnonConst => "constant",
+            OpaqueTy => "implement_trait",
+            AnonAdt => "adt",
+            _ => unreachable!(),
+        }),
+    };
+}
+
+pub fn component_name(component_data: &DefPathData) -> String {
+    let mut str = String::new();
+    push_component_name(*component_data, &mut str);
+    str
+}
+
+/// Returns a human readable string representation of the item defined by def_id.
+/// This is different from summary_key_str, in that it does not mangle type argument
+/// values into the item name and furthermore includes parameter types and the
+/// return types of functions. This is intended for use in call graphs.
+pub fn def_id_as_qualified_name_str(tcx: TyCtxt<'_>, def_id: DefId) -> Rc<str> {
+    let mut name = format!("/{}/", crate_name(tcx, def_id));
+    name.push_str(&tcx.def_path_str(def_id));
+    if tcx.def_kind(def_id).is_fn_like() {
+        let fn_ty = tcx.type_of(def_id).skip_binder();
+        name.push('(');
+        let fn_sig = if fn_ty.is_fn() {
+            fn_ty.fn_sig(tcx).skip_binder()
+        } else if let rustc_middle::ty::Closure(_, args) = fn_ty.kind() {
+            args.as_closure().sig().skip_binder()
+        } else {
+            unreachable!()
+        };
+        let mut first = true;
+        for param_ty in fn_sig.inputs() {
+            if first {
+                first = false;
+            } else {
+                name.push(',')
+            }
+            name.push_str(&format!("{param_ty:?}"));
+        }
+        name.push_str(")->");
+        name.push_str(&format!("{:?}", fn_sig.output()));
+    }
+    Rc::from(name.as_str())
+}
+
+/// Returns a readable display name for a DefId. This name may not be unique.
+pub fn def_id_display_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    struct PrettyDefId<'tcx>(DefId, TyCtxt<'tcx>);
+    impl std::fmt::Debug for PrettyDefId<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let mut printer = FmtPrinter::new(self.1, rustc_hir::def::Namespace::ValueNS);
+            printer.print_def_path(self.0, &[])?;
+            f.write_str(printer.into_buffer().as_str())
+        }
+    }
+    format!("{:?}", PrettyDefId(def_id, tcx))
+}
+
+/// Returns false if any of the generic arguments are themselves generic
+pub fn are_concrete(gen_args: GenericArgsRef<'_>) -> bool {
+    for gen_arg in gen_args.iter() {
+        if let GenericArgKind::Type(ty) = gen_arg.unpack() {
+            if !is_concrete(ty.kind()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Determines if the given type is fully concrete.
+pub fn is_concrete(ty: &TyKind<'_>) -> bool {
+    match ty {
+        TyKind::Adt(_, gen_args)
+        | TyKind::Closure(_, gen_args)
+        | TyKind::FnDef(_, gen_args)
+        | TyKind::Coroutine(_, gen_args)
+        | TyKind::Alias(_, rustc_middle::ty::AliasTy { args: gen_args, .. }) => {
+            are_concrete(gen_args)
+        }
+        TyKind::Tuple(types) => types.iter().all(|t| is_concrete(t.kind())),
+        TyKind::Bound(..)
+        | TyKind::Dynamic(..)
+        | TyKind::Error(..)
+        | TyKind::Infer(..)
+        | TyKind::Param(..) => false,
+        TyKind::Ref(_, ty, _) => is_concrete(ty.kind()),
+        _ => true,
+    }
+}
+
+/// Dumps a human readable MIR rendering of the function with the given DefId to standard output.
+pub fn pretty_print_mir(tcx: TyCtxt<'_>, def_id: DefId) {
+    if !matches!(
+        tcx.def_kind(def_id),
+        DefKind::Struct | DefKind::Variant
+    ) {
+        let mut stdout = std::io::stdout();
+        stdout.write_fmt(format_args!("{def_id:?}")).unwrap();
+        rustc_middle::mir::write_mir_pretty(tcx, Some(def_id), &mut stdout).unwrap();
+        let _ = stdout.flush();
     }
 }

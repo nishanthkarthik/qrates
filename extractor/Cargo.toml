@@ -28,7 +28,7 @@ itertools = "0.10.5"
 # This crate uses #[feature(rustc_private)]
 rustc_private = true
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 rustc_ast = {path = "/home/nishanth/.rustup/toolchains/nightly-2023-05-01-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_ast"}
 rustc_data_structures = {path = "/home/nishanth/.rustup/toolchains/nightly-2023-05-01-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_data_structures"}
 rustc_error_codes = {path = "/home/nishanth/.rustup/toolchains/nightly-2023-05-01-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_error_codes"}

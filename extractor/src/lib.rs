@@ -6,6 +6,7 @@
 #![feature(box_patterns)]
 
 extern crate rustc_ast;
+extern crate rustc_ast_ir;
 extern crate rustc_data_structures;
 extern crate rustc_error_codes;
 extern crate rustc_errors;
@@ -13,6 +14,7 @@ extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_metadata;
 extern crate rustc_middle;
+extern crate rustc_mir_build;
 extern crate rustc_mir_transform;
 extern crate rustc_session;
 extern crate rustc_span;
@@ -30,8 +32,9 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_interface::Queries;
+use rustc_middle::query::ExternProviders;
 use rustc_middle::ty::TyCtxt;
-use rustc_middle::util::{Providers};
+use rustc_middle::util::Providers;
 use rustc_session::Session;
 use rustc_span::def_id::LocalDefId;
 use std::collections::HashMap;
@@ -40,7 +43,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use rustc_middle::query::ExternProviders;
 
 /// The struct to share the state among queries.
 #[derive(Default)]
@@ -50,7 +52,7 @@ struct SharedState {
     function_unsafe_use: HashMap<DefId, bool>,
     function_unsafe_reasons: HashMap<DefId, Vec<&'static str>>,
     /// What `cfg!` configuration is enabled for this crate?
-    crate_cfg: Vec<(String, Option<String>)>,
+    crate_cfg: Vec<String>,
 }
 
 lazy_static! {
@@ -140,16 +142,18 @@ fn analyse_with_tcx(name: String, tcx: TyCtxt, session: &Session) {
                 );
             }
         }
-        for (key, value) in &state.crate_cfg {
+        // todo!("nishanthkarthik")
+        for key in &state.crate_cfg {
             filler.tables.register_crate_cfgs(
                 build,
                 key.clone(),
-                value
+                "n/a".to_string(),
+/*                value
                     .as_ref()
                     .map(String::as_str)
                     .unwrap_or("n/a")
                     .to_string(),
-            );
+*/            );
         }
     }
 
@@ -190,32 +194,32 @@ pub fn analyse<'tcx>(compiler: &Compiler, queries: &'tcx Queries<'tcx>) {
 pub fn override_queries(
     _session: &Session,
     providers: &mut Providers,
-    _providers_extern: &mut ExternProviders,
 ) {
-    providers.unsafety_check_result = unsafety_check_result;
+    // todo!("nishanthkarthik")
+    // providers.unsafety_check_result = unsafety_check_result;
     // providers.unsafety_check_result_for_const_arg = unsafety_check_result_for_const_arg;
 }
 
-fn unsafety_check_result<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    local_def_id: LocalDefId,
-) -> &'tcx rustc_middle::thir::UnsafetyCheckResult {
-    let mut providers = Providers::default();
-    rustc_mir_transform::provide(&mut providers);
-    let original_unsafety_check_result = providers.unsafety_check_result;
-    // if let None = ty::WithOptConstParam::try_lookup(local_def_id, tcx) {
-    // FIXME: check_unsafety changed too much and needs to be written from scratch.
-    // let (result, reasons) = check_unsafety::unsafety_check_result(
-    //     tcx,
-    //     ty::WithOptConstParam::unknown(local_def_id),
-    // );
-    // let def_id = local_def_id.to_def_id();
-    // let mut state = SHARED_STATE.lock().unwrap();
-    // state.function_unsafe_use.insert(def_id, result);
-    // state.function_unsafe_reasons.insert(def_id, reasons);
-    // }
-    original_unsafety_check_result(tcx, local_def_id)
-}
+// fn unsafety_check_result<'tcx>(
+//     tcx: TyCtxt<'tcx>,
+//     local_def_id: LocalDefId,
+// ) -> &'tcx rustc_middle::thir::UnsafetyCheckResult {
+//     let mut providers = Providers::default();
+//     rustc_mir_transform::provide(&mut providers);
+//     let original_unsafety_check_result = providers.unsafety_check_result;
+//     if let None = ty::WithOptConstParam::try_lookup(local_def_id, tcx) {
+//         // FIXME: check_unsafety changed too much and needs to be written from scratch.
+//         let (result, reasons) = check_unsafety::unsafety_check_result(
+//             tcx,
+//             ty::WithOptConstParam::unknown(local_def_id),
+//         );
+//         let def_id = local_def_id.to_def_id();
+//         let mut state = SHARED_STATE.lock().unwrap();
+//         state.function_unsafe_use.insert(def_id, result);
+//         state.function_unsafe_reasons.insert(def_id, reasons);
+//     }
+//     original_unsafety_check_result(tcx, local_def_id)
+// }
 
 // fn unsafety_check_result_for_const_arg<'tcx>(
 //     tcx: TyCtxt<'tcx>,
@@ -243,7 +247,7 @@ fn unsafety_check_result<'tcx>(
 // }
 
 /// Save `cfg!` configuration.
-pub fn save_cfg_configuration(set: &FxHashSet<(String, Option<String>)>) {
+pub fn save_cfg_configuration(set: &Vec<String>) {
     let mut state = SHARED_STATE.lock().unwrap();
-    state.crate_cfg = set.iter().cloned().collect();
+    state.crate_cfg = set.clone();
 }

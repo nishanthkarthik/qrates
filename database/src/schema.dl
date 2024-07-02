@@ -168,8 +168,10 @@ enum TyPrimitive {
     U32,
     U64,
     U128,
+    F16,
     F32,
     F64,
+    F128,
     Str,
     Never,
 }
@@ -215,7 +217,9 @@ enum AggregateKind {
     Tuple,
     Adt,
     Closure,
-    Generator,
+    Coroutine,
+    CoroutineClosure,
+    RawPtr,
 }
 
 /// The kind of a cast operation.
@@ -223,16 +227,15 @@ enum CastKind {
     /// Failed to obtain the kind from the compiler.
     #[default]
     Unknown,
-    Misc,
-    ReifyFnPointer,
-    UnsafeFnPointer,
-    UnsafeClosureFnPointer,
-    NormalClosureFnPointer,
-    MutToConstPointer,
-    ArrayToPointer,
-    UnsizePointer,
-    PointerExposeAddress,
-    PointerFromExposedAddress,
+    PointerExposeProvenance,
+    PointerWithExposedProvenance,
+    PointerCoercionReifyFnPointer,
+    PointerCoercionUnsafeFnPointer,
+    PointerCoercionClosureFnPointerSafe,
+    PointerCoercionClosureFnPointerUnsafe,
+    PointerCoercionMutToConstPointer,
+    PointerCoercionArrayToPointer,
+    PointerCoercionUnsize,
     DynStar,
     IntToInt,
     FloatToInt,
@@ -250,9 +253,10 @@ enum BorrowKind {
     Unknown,
     Shared,
     Shallow,
-    Unique,
+    Deep,
     Mut,
     MutTwoPhase,
+    MutClosureCapture,
 }
 
 /// The kind of a MIR basic block.
@@ -309,9 +313,7 @@ enum SpanExpansionKind {
     /// Desugaring done by the compiler during HIR lowering.
     DesugaringYeetExpr,
     /// Desugaring done by the compiler during HIR lowering.
-    DesugaringReplace,
-    /// Inlined MIR.
-    Inlined,
+    DesugaringBoundModifier,
 }
 
 /// rustc_hir::UnsafeSource
@@ -469,6 +471,7 @@ relation types_tuple(typ: Type);
 relation types_tuple_element(tuple_type: Type, index: TupleFieldIndex, typ: Type);
 relation types_projection(typ: Type, trait_def_path: DefPath, trait_item: DefPath);
 relation types_opaque(typ: Type, def_path: DefPath);
+relation types_inherent(typ: Type, def_path: DefPath);
 relation types_param(typ: Type, index: u32, name: InternedString);
 
 /// Traits.
@@ -489,7 +492,7 @@ relation statements_assign_address(stmt: auto Statement, target_type: Type, sour
 relation statements_assign_len(stmt: auto Statement, target_type: Type, source_type: Type);
 relation statements_assign_cast(stmt: auto Statement, target_type: Type, kind: CastKind, operand: Operand, typ: Type);
 relation statements_assign_binary_op(stmt: auto Statement, target_type: Type, kind: BinOp, first: Operand, second: Operand);
-relation statements_assign_checked_binary_op(stmt: auto Statement, target_type: Type, kind: BinOp, first: Operand, second: Operand);
+relation statements_assign_unchecked_binary_op(stmt: auto Statement, target_type: Type, kind: BinOp, first: Operand, second: Operand);
 relation statements_assign_nullary_op(stmt: auto Statement, target_type: Type, kind: NullOp, source_type: Type);
 relation statements_assign_unary_op(stmt: auto Statement, target_type: Type, kind: UnOp, operand: Operand);
 relation statements_assign_discriminant(stmt: auto Statement, target_type: Type, source_type: Type);

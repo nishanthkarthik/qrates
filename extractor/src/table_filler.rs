@@ -41,20 +41,20 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
     pub fn resolve_def_id(&mut self, def_id: hir::def_id::DefId) -> types::DefPath {
         let crate_num = def_id.krate;
         let crate_name = self.tcx.crate_name(crate_num).as_str().to_string();
-        let crate_hash = self.tcx.crate_hash(crate_num).as_u64().into();
+        let crate_hash = self.tcx.crate_hash(crate_num).as_u128().into();
         let def_path_str = self.tcx.def_path_debug_str(def_id);
         let def_path_hash = {
             let (f, s) = self.tcx.def_path_hash(def_id).0.split();
             (f.as_u64(), s.as_u64()).into()
         };
         let summary_key_str = mirai_utils::summary_key_str(self.tcx, def_id);
-        let summary_key_str_value = std::rc::Rc::try_unwrap(summary_key_str).unwrap();
+        let summary_key_str = summary_key_str.to_string();
         let def_path = self.tables.register_def_paths(
             crate_name,
             crate_hash,
             def_path_str,
             def_path_hash,
-            summary_key_str_value,
+            summary_key_str,
         );
 
         if def_id.is_local() {
@@ -81,7 +81,7 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                 call_site_span,
                 expansion_data.kind.convert_into(),
                 expansion_data.kind.descr().to_string(),
-                location.file.name.prefer_remapped().to_string(),
+                location.file.name.prefer_remapped_unconditionaly().to_string(),
                 location.line as u16,
                 location.col.to_usize() as u16,
             );
@@ -90,7 +90,7 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                 self.tables.register_macro_expansions(
                     interned_span,
                     symbol.to_string(),
-                    def_site_location.file.name.prefer_remapped().to_string(),
+                    def_site_location.file.name.prefer_remapped_unconditionaly().to_string(),
                     def_site_location.line as u16,
                     def_site_location.col.to_usize() as u16,
                 );
@@ -194,7 +194,7 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                         .register_types_slice(interned_type, element_interned_type);
                     interned_type
                 }
-                ty::TyKind::RawPtr(ty::TypeAndMut { ty, mutbl }) => {
+                ty::TyKind::RawPtr(ty, mutbl ) => {
                     let interned_type = self.insert_new_type_into_table("RawPtr", typ);
                     let target_type = self.register_type(*ty);
                     self.tables.register_types_raw_ptr(
@@ -261,20 +261,15 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                         .register_types_closure(interned_type, closure_def_path);
                     interned_type
                 }
-                ty::TyKind::Generator(def_id, _substs, _movability) => {
-                    let interned_type = self.insert_new_type_into_table("Generator", typ);
+                ty::TyKind::Coroutine(def_id, _args) => {
+                    let interned_type = self.insert_new_type_into_table("Coroutine", typ);
                     let generator_def_path = self.resolve_def_id(*def_id);
                     self.tables
                         .register_types_generator(interned_type, generator_def_path);
                     interned_type
                 }
-                ty::TyKind::GeneratorWitness(_binder) => {
-                    let interned_type = self.insert_new_type_into_table("GeneratorWitness", typ);
-                    self.tables.register_types_generator_witness(interned_type);
-                    interned_type
-                }
-                ty::TyKind::GeneratorWitnessMIR(_def_id, _substs) => {
-                    let interned_type = self.insert_new_type_into_table("GeneratorWitnessMIR", typ);
+                ty::TyKind::CoroutineWitness(_def_id, _args) => {
+                    let interned_type = self.insert_new_type_into_table("CoroutineWitness", typ);
                     self.tables.register_types_generator_witness(interned_type);
                     interned_type
                 }
@@ -292,7 +287,7 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                     interned_type
                 }
                 ty::TyKind::Alias(alias_kind, alias_type) => match alias_kind {
-                    ty::AliasKind::Projection => {
+                    ty::AliasTyKind::Projection => {
                         let interned_type = self.insert_new_type_into_table("Projection", typ);
                         let trait_def_id = alias_type.trait_def_id(self.tcx);
                         let trait_def_path = self.resolve_def_id(trait_def_id);
@@ -304,10 +299,23 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                         );
                         interned_type
                     }
-                    ty::AliasKind::Opaque => {
+                    ty::AliasTyKind::Opaque => {
                         let interned_type = self.insert_new_type_into_table("Opaque", typ);
                         let def_path = self.resolve_def_id(alias_type.def_id);
                         self.tables.register_types_opaque(interned_type, def_path);
+                        interned_type
+                    }
+                    ty::AliasTyKind::Inherent => {
+                        let interned_type = self.insert_new_type_into_table("Inherent", typ);
+                        let def_path = self.resolve_def_id(alias_type.def_id);
+                        self.tables.register_types_inherent(interned_type, def_path);
+                        interned_type
+                    }
+                    ty::AliasTyKind::Weak => {
+                        // TODO: Does this alias need normalizing?
+                        let interned_type = self.insert_new_type_into_table("Weak", typ);
+                        let def_path = self.resolve_def_id(alias_type.def_id);
+                        self.tables.register_types_inherent(interned_type, def_path);
                         interned_type
                     }
                 },
@@ -319,13 +327,19 @@ impl<'a, 'tcx> TableFiller<'a, 'tcx> {
                         param_ty.name.to_string(),
                     );
                     interned_type
-                }
+                },
+                ty::TyKind::Pat(param_ty, pat) => {
+                    todo!("nishanthkarthik")
+                },
+                ty::TyKind::CoroutineClosure(def_id, args) => {
+                    todo!("nishanthkarthik")
+                },
                 ty::TyKind::Bound(..)
                 | ty::TyKind::Placeholder(_)
                 | ty::TyKind::Infer(_)
                 | ty::TyKind::Error(_) => {
                     unreachable!();
-                }
+                },
             }
         };
         result

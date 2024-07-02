@@ -8,8 +8,10 @@ use crate::utils::*;
 use corpus_database::types;
 use rustc_hir as hir;
 use rustc_middle::mir;
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::mir::BinOp;
+use rustc_middle::ty::{self, TyCtxt, TyKind};
 use std::collections::HashMap;
+use rustc_hir::intravisit::Map;
 
 pub(crate) struct MirVisitor<'a, 'b, 'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -95,8 +97,8 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
             let mir_scope_safety = self.get_scope_safety(scope);
             let group;
             let check_mode;
-            if let Some(mir::Safety::ExplicitUnsafe(hir_id)) = &mir_scope_safety {
-                match self.tcx.hir().get(*hir_id) {
+            if let Some(rustc_middle::thir::BlockSafety::ExplicitUnsafe(hir_id)) = &mir_scope_safety {
+                match self.tcx.hir().hir_node(*hir_id) {
                     hir::Node::Block(block) => {
                         check_mode = block.rules.convert_into();
                     }
@@ -123,10 +125,12 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
             self.scopes.insert(scope, scope_id);
         }
     }
-    fn get_scope_safety(&self, scope: mir::SourceScope) -> Option<mir::Safety> {
+    fn get_scope_safety(&self, scope: mir::SourceScope) -> Option<rustc_middle::thir::BlockSafety> {
+        // TODO(Karthik): To be implemented
         match self.body.source_scopes[scope].local_data {
-            mir::ClearCrossCrate::Set(ref data) => Some(data.safety),
-            mir::ClearCrossCrate::Clear => None,
+            _ => todo!("nishanthkarthik"),
+            // mir::ClearCrossCrate::Set(ref data) => Some(data.safety),
+            // mir::ClearCrossCrate::Clear => None,
         }
     }
     fn visit_statement(&mut self, statement: &mir::Statement<'tcx>) -> (types::Statement, String) {
@@ -200,6 +204,30 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                         );
                         (stmt, "Assign/Cast")
                     }
+                    // Instead of CheckedBinaryOp used in old rustc, we track the unchecked versions here
+                    mir::Rvalue::BinaryOp(op, box (first, second))
+                        if matches!(
+                            op,
+                            BinOp::AddUnchecked
+                                | BinOp::SubUnchecked
+                                | BinOp::MulUnchecked
+                                | BinOp::ShlUnchecked
+                                | BinOp::ShrUnchecked
+                        ) =>
+                    {
+                        let first_interned_operand = self.visit_operand(first);
+                        let second_interned_operand = self.visit_operand(second);
+                        let (stmt,) = self
+                            .filler
+                            .tables
+                            .register_statements_assign_unchecked_binary_op(
+                                interned_target_type,
+                                format!("{:?}", op),
+                                first_interned_operand,
+                                second_interned_operand,
+                            );
+                        (stmt, "Assign/UncheckedBinaryOp")
+                    }
                     mir::Rvalue::BinaryOp(op, box (first, second)) => {
                         let first_interned_operand = self.visit_operand(first);
                         let second_interned_operand = self.visit_operand(second);
@@ -210,20 +238,6 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                             second_interned_operand,
                         );
                         (stmt, "Assign/BinaryOp")
-                    }
-                    mir::Rvalue::CheckedBinaryOp(op, box (first, second)) => {
-                        let first_interned_operand = self.visit_operand(first);
-                        let second_interned_operand = self.visit_operand(second);
-                        let (stmt,) = self
-                            .filler
-                            .tables
-                            .register_statements_assign_checked_binary_op(
-                                interned_target_type,
-                                format!("{:?}", op),
-                                first_interned_operand,
-                                second_interned_operand,
-                            );
-                        (stmt, "Assign/CheckedBinaryOp")
                     }
                     mir::Rvalue::NullaryOp(op, typ) => {
                         let interned_type = self.filler.register_type(*typ);
@@ -365,7 +379,7 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                     no_block,
                 );
             }
-            mir::UnwindAction::Terminate => {
+            mir::UnwindAction::Terminate(_reason) => {
                 this.filler.tables.register_terminators_unwind_action(
                     block,
                     types::UnwindAction::Terminate,
@@ -401,14 +415,15 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                 }
                 "SwitchInt"
             }
-            mir::TerminatorKind::Resume => "Resume",
+            mir::TerminatorKind::UnwindResume => "UnwindResume",
             mir::TerminatorKind::Return => "Return",
             mir::TerminatorKind::Unreachable => "Unreachable",
-            mir::TerminatorKind::Terminate => "Terminate",
+            mir::TerminatorKind::UnwindTerminate(_reason) => "UnwindTerminate",
             mir::TerminatorKind::Drop {
                 place,
                 target,
                 unwind,
+                ..
             } => {
                 let place_type = self.filler.register_type(place.ty(self.body, self.tcx).ty);
                 register_unwind_action(self, unwind);
@@ -426,8 +441,8 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                 destination,
                 target,
                 unwind,
-                from_hir_call: _,
                 fn_span,
+                ..
             } => {
                 let interned_func = self.visit_operand(func);
                 let (return_ty, destination_block) = if let Some(target_block) = target {
@@ -436,12 +451,14 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                         basic_blocks[target_block],
                     )
                 } else {
-                    (self.tcx.mk_unit(), no_block)
+                    let unit_type = self.tcx.mk_ty_from_kind(TyKind::Tuple(&ty::List::empty()));
+                    (unit_type, no_block)
                 };
                 let interned_return_ty = self.filler.register_type(return_ty);
                 let func_ty = func.ty(self.body, self.tcx);
                 let sig = func_ty.fn_sig(self.tcx);
-                let unsafety = sig.unsafety().convert_into();
+                // todo!("nishanthkarthik")
+                let unsafety = types::Unsafety::Unknown;
                 let abi = sig.abi().name().to_string();
                 let span = self.filler.register_span(*fn_span);
                 register_unwind_action(self, unwind);
@@ -455,7 +472,7 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                     span,
                 );
                 for (i, arg) in args.iter().enumerate() {
-                    let interned_arg = self.visit_operand(arg);
+                    let interned_arg = self.visit_operand(&arg.node);
                     self.filler.tables.register_terminators_call_arg(
                         function_call,
                         i.into(),
@@ -479,7 +496,7 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
 
                 match func {
                     mir::Operand::Constant(constant) => {
-                        match constant.literal.ty().kind() {
+                        match constant.const_.ty().kind() {
                             ty::TyKind::FnDef(target_id, substs) => {
                                 let generics = self.tcx.generics_of(*target_id);
                                 if generics.has_self {
@@ -551,7 +568,7 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                 );
                 "Yield"
             }
-            mir::TerminatorKind::GeneratorDrop => "GeneratorDrop",
+            mir::TerminatorKind::CoroutineDrop => "CoroutineDrop",
             mir::TerminatorKind::FalseEdge {
                 real_target,
                 imaginary_target,
@@ -573,14 +590,7 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
                     .register_terminators_false_unwind(block, basic_blocks[real_target]);
                 "FalseUnwind"
             }
-            mir::TerminatorKind::InlineAsm {
-                template: _,
-                operands: _,
-                options: _,
-                line_spans: _,
-                destination: _,
-                unwind: _,
-            } => {
+            mir::TerminatorKind::InlineAsm { .. } => {
                 self.filler.tables.register_terminators_inline_asm(block);
                 "InlineAsm"
             }

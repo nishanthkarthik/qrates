@@ -4,7 +4,8 @@
 
 use corpus_database::types;
 use rustc_hir as hir;
-use rustc_middle::{mir, ty};
+use rustc_middle::mir::{FakeBorrowKind, MutBorrowKind};
+use rustc_middle::{mir, thir, ty};
 
 pub trait ConvertInto<T> {
     fn convert_into(&self) -> T;
@@ -19,11 +20,11 @@ impl ConvertInto<types::TyVisibility> for ty::Visibility<rustc_hir::def_id::DefI
     }
 }
 
-impl ConvertInto<types::Unsafety> for hir::Unsafety {
+impl ConvertInto<types::Unsafety> for hir::Safety {
     fn convert_into(&self) -> types::Unsafety {
         match self {
-            hir::Unsafety::Unsafe => types::Unsafety::Unsafe,
-            hir::Unsafety::Normal => types::Unsafety::Normal,
+            hir::Safety::Unsafe => types::Unsafety::Unsafe,
+            hir::Safety::Safe => types::Unsafety::Normal,
         }
     }
 }
@@ -55,8 +56,9 @@ impl ConvertInto<types::SpanExpansionKind> for rustc_span::hygiene::ExpnKind {
             Desugaring(DesugaringKind::ForLoop) => types::SpanExpansionKind::DesugaringForLoop,
             Desugaring(DesugaringKind::WhileLoop) => types::SpanExpansionKind::DesugaringWhileLoop,
             Desugaring(DesugaringKind::YeetExpr) => types::SpanExpansionKind::DesugaringYeetExpr,
-            Desugaring(DesugaringKind::Replace) => types::SpanExpansionKind::DesugaringReplace,
-            Inlined => types::SpanExpansionKind::Inlined,
+            Desugaring(DesugaringKind::BoundModifier) => {
+                types::SpanExpansionKind::DesugaringBoundModifier
+            }
         }
     }
 }
@@ -95,17 +97,13 @@ impl ConvertInto<types::BorrowKind> for mir::BorrowKind {
     fn convert_into(&self) -> types::BorrowKind {
         match self {
             mir::BorrowKind::Shared => types::BorrowKind::Shared,
-            mir::BorrowKind::Shallow => types::BorrowKind::Shallow,
-            mir::BorrowKind::Unique => types::BorrowKind::Unique,
-            mir::BorrowKind::Mut {
-                allow_two_phase_borrow,
-            } => {
-                if *allow_two_phase_borrow {
-                    types::BorrowKind::MutTwoPhase
-                } else {
-                    types::BorrowKind::Mut
-                }
-            }
+            mir::BorrowKind::Fake(FakeBorrowKind::Deep) => types::BorrowKind::Deep,
+            mir::BorrowKind::Fake(FakeBorrowKind::Shallow) => types::BorrowKind::Shallow,
+            mir::BorrowKind::Mut {kind} => match kind {
+                MutBorrowKind::Default => types::BorrowKind::Mut,
+                MutBorrowKind::TwoPhaseBorrow => types::BorrowKind::MutTwoPhase,
+                MutBorrowKind::ClosureCapture => types::BorrowKind::MutClosureCapture,
+            },
         }
     }
 }
@@ -113,21 +111,29 @@ impl ConvertInto<types::BorrowKind> for mir::BorrowKind {
 impl ConvertInto<types::CastKind> for mir::CastKind {
     fn convert_into(&self) -> types::CastKind {
         match self {
-            mir::CastKind::Pointer(pointer) => match pointer {
-                ty::adjustment::PointerCast::ReifyFnPointer => types::CastKind::ReifyFnPointer,
-                ty::adjustment::PointerCast::UnsafeFnPointer => types::CastKind::UnsafeFnPointer,
-                ty::adjustment::PointerCast::ClosureFnPointer(usafety) => match usafety {
-                    hir::Unsafety::Unsafe => types::CastKind::UnsafeClosureFnPointer,
-                    hir::Unsafety::Normal => types::CastKind::NormalClosureFnPointer,
-                },
-                ty::adjustment::PointerCast::MutToConstPointer => {
-                    types::CastKind::MutToConstPointer
+            mir::CastKind::PointerCoercion(pointer) => match pointer {
+                ty::adjustment::PointerCoercion::ReifyFnPointer => {
+                    types::CastKind::PointerCoercionReifyFnPointer
                 }
-                ty::adjustment::PointerCast::ArrayToPointer => types::CastKind::ArrayToPointer,
-                ty::adjustment::PointerCast::Unsize => types::CastKind::UnsizePointer,
+                ty::adjustment::PointerCoercion::UnsafeFnPointer => {
+                    types::CastKind::PointerCoercionUnsafeFnPointer
+                }
+                ty::adjustment::PointerCoercion::ClosureFnPointer(safety) => match safety {
+                    hir::Safety::Unsafe => types::CastKind::PointerCoercionClosureFnPointerUnsafe,
+                    hir::Safety::Safe => types::CastKind::PointerCoercionClosureFnPointerSafe,
+                },
+                ty::adjustment::PointerCoercion::MutToConstPointer => {
+                    types::CastKind::PointerCoercionMutToConstPointer
+                }
+                ty::adjustment::PointerCoercion::ArrayToPointer => {
+                    types::CastKind::PointerCoercionArrayToPointer
+                }
+                ty::adjustment::PointerCoercion::Unsize => types::CastKind::PointerCoercionUnsize,
             },
-            mir::CastKind::PointerExposeAddress => types::CastKind::PointerExposeAddress,
-            mir::CastKind::PointerFromExposedAddress => types::CastKind::PointerFromExposedAddress,
+            mir::CastKind::PointerExposeProvenance => types::CastKind::PointerExposeProvenance,
+            mir::CastKind::PointerWithExposedProvenance => {
+                types::CastKind::PointerWithExposedProvenance
+            }
             mir::CastKind::DynStar => types::CastKind::DynStar,
             mir::CastKind::IntToInt => types::CastKind::IntToInt,
             mir::CastKind::FloatToInt => types::CastKind::FloatToInt,
@@ -147,18 +153,21 @@ impl<'tcx> ConvertInto<types::AggregateKind> for mir::AggregateKind<'tcx> {
             mir::AggregateKind::Tuple => types::AggregateKind::Tuple,
             mir::AggregateKind::Adt(..) => types::AggregateKind::Adt,
             mir::AggregateKind::Closure(..) => types::AggregateKind::Closure,
-            mir::AggregateKind::Generator(..) => types::AggregateKind::Generator,
+            mir::AggregateKind::Coroutine(..) => types::AggregateKind::Coroutine,
+            mir::AggregateKind::CoroutineClosure(..) => types::AggregateKind::CoroutineClosure,
+            mir::AggregateKind::RawPtr(..) => types::AggregateKind::RawPtr,
         }
     }
 }
 
-impl ConvertInto<types::ScopeSafety> for Option<mir::Safety> {
+impl ConvertInto<types::ScopeSafety> for Option<thir::BlockSafety> {
     fn convert_into(&self) -> types::ScopeSafety {
         match self {
-            Some(mir::Safety::Safe) => types::ScopeSafety::Safe,
-            Some(mir::Safety::BuiltinUnsafe) => types::ScopeSafety::BuiltinUnsafe,
-            Some(mir::Safety::FnUnsafe) => types::ScopeSafety::FnUnsafe,
-            Some(mir::Safety::ExplicitUnsafe(_)) => types::ScopeSafety::ExplicitUnsafe,
+            Some(thir::BlockSafety::Safe) => types::ScopeSafety::Safe,
+            Some(thir::BlockSafety::BuiltinUnsafe) => types::ScopeSafety::BuiltinUnsafe,
+            // todo!("nishanthkarthik")
+            // Some(thir::BlockSafety::FnUnsafe) => types::ScopeSafety::FnUnsafe,
+            Some(thir::BlockSafety::ExplicitUnsafe(_)) => types::ScopeSafety::ExplicitUnsafe,
             None => types::ScopeSafety::Unknown,
         }
     }
@@ -198,6 +207,8 @@ impl<'tcx> ConvertInto<types::TyPrimitive> for ty::TyKind<'tcx> {
             ty::TyKind::Float(float_ty) => match float_ty {
                 ty::FloatTy::F32 => F32,
                 ty::FloatTy::F64 => F64,
+                ty::FloatTy::F16 => F16,
+                ty::FloatTy::F128 => F128,
             },
             ty::TyKind::Str => Str,
             ty::TyKind::Never => Never,

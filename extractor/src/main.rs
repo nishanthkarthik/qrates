@@ -6,13 +6,18 @@
 
 extern crate rustc_driver;
 extern crate rustc_interface;
+extern crate rustc_errors;
+extern crate rustc_session;
 
 use corpus_extractor::{analyse, override_queries, save_cfg_configuration};
 use rustc_driver::Compilation;
+use rustc_errors::emitter::HumanReadableErrorType;
+use rustc_errors::ColorConfig;
 use rustc_interface::{
     interface::{Compiler, Config},
     Queries,
 };
+use rustc_session::config::ErrorOutputType;
 use std::process;
 
 struct CorpusCallbacks {}
@@ -34,7 +39,11 @@ impl rustc_driver::Callbacks for CorpusCallbacks {
 }
 
 fn main() {
-    rustc_driver::init_rustc_env_logger();
+    let early_dcx = rustc_session::EarlyDiagCtxt::new(ErrorOutputType::Json {
+        pretty: true,
+        json_rendered: HumanReadableErrorType::Default(ColorConfig::Auto),
+    });
+    rustc_driver::init_rustc_env_logger(&early_dcx);
     let mut callbacks = CorpusCallbacks {};
     let exit_code = rustc_driver::catch_with_exit_code(|| {
         use std::env;

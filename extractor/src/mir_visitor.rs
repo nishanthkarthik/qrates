@@ -11,6 +11,7 @@ use rustc_middle::mir;
 use rustc_middle::mir::BinOp;
 use rustc_middle::ty::{self, TyCtxt, TyKind};
 use std::collections::HashMap;
+use log::warn;
 use rustc_hir::intravisit::Map;
 
 pub(crate) struct MirVisitor<'a, 'b, 'tcx> {
@@ -128,7 +129,7 @@ impl<'a, 'b, 'tcx> MirVisitor<'a, 'b, 'tcx> {
     fn get_scope_safety(&self, scope: mir::SourceScope) -> Option<rustc_middle::thir::BlockSafety> {
         // TODO(Karthik): To be implemented
         match self.body.source_scopes[scope].local_data {
-            _ => todo!("nishanthkarthik"),
+            _ => { warn!("nishanthkarthik"); None },
             // mir::ClearCrossCrate::Set(ref data) => Some(data.safety),
             // mir::ClearCrossCrate::Clear => None,
         }
